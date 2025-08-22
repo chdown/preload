@@ -4,137 +4,182 @@ import 'package:flutter/material.dart';
 import 'preload_controller.dart';
 
 class PreloadManager<T> {
-  late int _preloadBackward;
-  late int _preloadForward;
-  late int _windowSize;
-  late final List<PreloadController> _preloadWindow = [];
-  late int _end;
-  int _prevIndex = 0;
-  int _start = 0;
-  int _activeIndex = -1; // 当前播放索引
-  final bool _autoplayFirstVideo;
-  bool _firstVideoPlayed = false;
+  // 核心数据
+  List<T> _data = [];
+  final List<PreloadController> _controllers = [];
 
-  List<T> _videoData = [];
-  bool _isPaginating = false;
+  // 核心状态（简化）
+  int _activeIndex = -1; // 当前活跃索引
+  int _centerIndex = 0; // 窗口中心索引
+  int _prevIndex = 0; // 上一个索引
 
+  // 配置参数（使用 this.xxx 初始化）
+  final int preloadBackward;
+  final int preloadForward;
   final int paginationThreshold;
 
-  // Custom controller factory
-  final PreloadController Function(T data) controllerFactory;
-
-  // 状态管理
+  // 控制标志
+  bool _isPaginating = false;
+  final bool autoplayFirstItem;
+  bool _firstItemPlayed = false;
   bool _disposed = false;
+  bool _isRebuilding = false; // 新增：防止并发重建
 
-  /// 控制器初始化完成时的回调
+  // 回调函数
+  final PreloadController Function(T data) controllerFactory;
   final void Function(PreloadController controller)? onControllerInitialized;
-
-  /// 播放状态变化时的回调
   final void Function()? onPlayStateChanged;
-
-  /// 触达分页阈值时的回调（用于拉取更多数据）
-  final Future<List<T>> Function()? onPaginationNeeded;
+  final Future<void> Function()? onPaginationNeeded;
 
   PreloadManager({
-    int? preloadBackward,
-    int? preloadForward,
-    int? windowSize,
-    required List<T> videoData,
+    this.preloadBackward = 3,
+    this.preloadForward = 3,
+    this.paginationThreshold = 5,
+    required List<T> data,
     required this.controllerFactory,
     this.onControllerInitialized,
     this.onPlayStateChanged,
     this.onPaginationNeeded,
-    this.paginationThreshold = 5,
-    bool autoplayFirstVideo = false,
-  }) : _autoplayFirstVideo = autoplayFirstVideo {
-    _videoData = List.of(videoData);
+    this.autoplayFirstItem = false,
+  }) {
+    _data = List.of(data);
 
-    _preloadBackward = preloadBackward ?? 3;
-    _preloadForward = preloadForward ?? 3;
-    _windowSize = windowSize ?? 8;
+    // 验证参数
+    assert(preloadBackward >= 0, 'preloadBackward must be non-negative');
+    assert(preloadForward >= 0, 'preloadForward must be non-negative');
+    assert(paginationThreshold >= 0, 'paginationThreshold must be non-negative');
 
-    assert(
-      _preloadBackward <= _windowSize,
-      'preloadBackward must not exceed windowSize',
-    );
-    assert(
-      _preloadForward <= _windowSize,
-      'preloadForward must not exceed windowSize',
-    );
-    assert(
-      _preloadBackward + _preloadForward < _windowSize,
-      'Sum of preloadBackward and preloadForward must be less than windowSize',
-    );
-
-    // 检查 videoData 是否为空
-    if (_videoData.isEmpty) {
-      _start = 0;
-      _end = 0;
-      _log('No videos provided, initializing with empty window', emoji: '⚠️', color: 'yellow');
-      return;
+    // 初始化窗口（异步，但不等待）
+    if (_data.isNotEmpty) {
+      // 使用 Future.microtask 确保在构造函数完成后执行
+      Future.microtask(() {
+        _rebuildPreloadWindow(0).catchError((error) {
+          _log('Failed to initialize preload window: $error', emoji: '❌', color: 'red');
+        });
+      });
     }
-
-    int initialLoadSize = _windowSize > _videoData.length ? _videoData.length : _windowSize;
-
-    for (int i = 0; i < initialLoadSize; i++) {
-      _preloadWindow.add(_initController(_videoData[i], i));
-    }
-
-    _start = 0;
-    _end = _preloadWindow.length;
-
-    _seeWhatsInsidePreloadWindow();
   }
 
-  int _lastActivePaginationIndex = -1;
+  /// 核心方法：重建预加载窗口
+  /// 这是统一窗口管理的核心，所有操作都通过这个方法
+  Future<void> _rebuildPreloadWindow(int centerIndex) async {
+    if (_disposed) return;
 
-  PreloadController _initController(T data, int index) {
+    // 添加重建互斥锁，防止并发重建
+    if (_isRebuilding) {
+      _log('Window rebuild already in progress, skipping...', emoji: '⏳', color: 'yellow');
+      return;
+    }
+    _isRebuilding = true;
+
+    try {
+      _log('Rebuilding window around center: $centerIndex', emoji: '🔨', color: 'blue');
+
+      // 数据为空或索引无效检查
+      if (_data.isEmpty || centerIndex < 0 || centerIndex >= _data.length) {
+        _log('No data available or invalid center index: $centerIndex (data length: ${_data.length})', emoji: '🧹', color: 'yellow');
+        return;
+      }
+
+      // 计算窗口范围
+      int start = (centerIndex - preloadBackward).clamp(0, _data.length - 1);
+      int end = (centerIndex + preloadForward + 1).clamp(0, _data.length);
+
+      // 创建新的控制器列表（不立即销毁旧的）
+      final newControllers = <PreloadController>[];
+
+      // 创建新控制器
+      for (int i = start; i < end; i++) {
+        newControllers.add(_createController(_data[i], i));
+      }
+
+      // 等待所有新控制器初始化完成
+      await Future.wait(newControllers.map((controller) => controller.initialize()));
+
+      // 现在安全地销毁旧控制器
+      for (var controller in _controllers) {
+        await _disposeController(controller);
+      }
+
+      // 更新控制器列表
+      _controllers.clear();
+      _controllers.addAll(newControllers);
+      _centerIndex = centerIndex;
+
+      _log('Window rebuilt: ${_controllers.length} controllers from index $start to ${end - 1}', emoji: '✅', color: 'green');
+
+      // 处理控制器初始化完成的回调
+      for (int i = 0; i < newControllers.length; i++) {
+        final controller = newControllers[i];
+        final globalIndex = start + i;
+
+        if (onControllerInitialized != null) {
+          onControllerInitialized!(controller);
+        }
+
+        // 处理自动播放逻辑
+        if (autoplayFirstItem && globalIndex == 0 && !_firstItemPlayed) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!_disposed && globalIndex == _activeIndex) {
+              _autoPlayCurrent(0);
+              _firstItemPlayed = true;
+            }
+          });
+        }
+
+        // 如果这是当前活跃索引，自动播放
+        if (globalIndex == _activeIndex && !_disposed) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!_disposed && globalIndex == _activeIndex) {
+              _autoPlayCurrent(globalIndex);
+            }
+          });
+        }
+      }
+    } finally {
+      _isRebuilding = false;
+    }
+  }
+
+  PreloadController _createController(T data, int index) {
     final controller = controllerFactory(data);
-    controller.initialize().then((_) {
-      _log(
-        'Controller initialized successfully for: $data',
-        emoji: '✅',
-        color: 'green',
-      );
-      if (_autoplayFirstVideo && index == 0 && !_firstVideoPlayed) {
-        //add post frame callback to play the video
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          _autoPlayCurrent(0);
-          _firstVideoPlayed = true;
-        });
-      }
-      // 修复异步竞态：检查当前索引是否仍然是活跃索引
-      if (index == _activeIndex && !_disposed) {
-        _autoPlayCurrent(index);
-      }
-      if (onControllerInitialized != null) {
-        onControllerInitialized!(controller);
-      }
-    }).catchError((error) {
-      _log(
-        'Failed to initialize controller for: $data - Error: $error',
-        emoji: '❌',
-        color: 'red',
-      );
-    });
+
+    // 不在这里调用initialize，让_rebuildPreloadWindow统一管理
+    // 这样可以确保所有控制器都准备好后再销毁旧的
+
     return controller;
   }
 
   Future<void> _disposeController(PreloadController controller) async {
     try {
-      await controller.pause();
+      // 先暂停，再释放（安全地处理可能未初始化的控制器）
+      try {
+        if (controller.isInitialized && controller.isPlaying) {
+          await controller.pause();
+        }
+      } catch (e) {
+        // 暂停失败不影响释放
+        _log('Error pausing controller before dispose: $e', emoji: '⚠️', color: 'yellow');
+      }
+
+      // 等待一小段时间，确保Surface完全释放
+      await Future.delayed(const Duration(milliseconds: 50));
+
       await controller.dispose();
-      _log('Controller disposed successfully', emoji: '🗑️', color: 'yellow');
+
+      // 再等待一小段时间，确保资源完全清理
+      await Future.delayed(const Duration(milliseconds: 50));
     } catch (e) {
-      _log('Error disposing controller: $e', emoji: '⚠️', color: 'red');
+      _log('Error disposing controller: $e', emoji: '❌', color: 'red');
+      // 即使出错也要继续，防止阻塞其他清理操作
     }
   }
 
-  /// 检查是否需要分页并触发
-  Future<void> _checkAndTriggerPagination(int currentIndex) async {
+  /// 检查并触发分页
+  Future<void> _triggerPaginationIfNeeded(int currentIndex) async {
     if (_isPaginating) return;
 
-    final remainingItems = _videoData.length - currentIndex - 1;
+    final remainingItems = _data.length - currentIndex - 1;
 
     if (remainingItems <= paginationThreshold && onPaginationNeeded != null) {
       _isPaginating = true;
@@ -145,15 +190,12 @@ class PreloadManager<T> {
       );
 
       try {
-        final newUrls = await onPaginationNeeded!();
-        if (newUrls.isNotEmpty) {
-          _videoData.addAll(newUrls);
-          _log(
-            'Added ${newUrls.length} new videos via pagination',
-            emoji: '➕',
-            color: 'green',
-          );
-        }
+        await onPaginationNeeded!();
+        _log(
+          'Added new items via pagination',
+          emoji: '➕',
+          color: 'green',
+        );
       } catch (e) {
         _log('Pagination failed: $e', emoji: '❌', color: 'red');
       } finally {
@@ -162,100 +204,23 @@ class PreloadManager<T> {
     }
   }
 
-  Future<void> _onScrollForward(
-    int index,
-  ) async {
-    if (_disposed) return; // 防止在已销毁状态下调用
-
-    // 分页检查已在 scroll() 中处理
-    if (_end >= _videoData.length) {
-      _log(
-        "Cannot scroll forward - reached end of videos",
-        emoji: '🛑',
-        color: 'yellow',
-      );
-
-      if (_lastActivePaginationIndex == -1) {
-        _lastActivePaginationIndex = index - 1;
-      }
-      return;
-    }
-
-    var newController = _initController(_videoData[_end], _end);
-    _preloadWindow.add(newController);
-
-    if (_preloadWindow.length > _windowSize) {
-      await _disposeController(_preloadWindow.removeAt(0));
-    }
-
-    _start++;
-    _end++;
-    _log(
-      'Scrolled forward - Window: $_start to $_end',
-      emoji: '⏩',
-      color: 'cyan',
-    );
-    _seeWhatsInsidePreloadWindow();
-  }
-
-  Future<void> _onScrollBackward(int index) async {
-    if (_disposed) return; // 防止在已销毁状态下调用
-
-    if (_start <= 0) {
-      _log(
-        "Cannot scroll backward - reached beginning",
-        emoji: '🛑',
-        color: 'yellow',
-      );
-      return;
-    }
-
-    if (_lastActivePaginationIndex != -1 && _lastActivePaginationIndex < index) {
-      _log(
-        "Index not active yet for backward scroll",
-        emoji: '⏸️',
-        color: 'yellow',
-      );
-      return;
-    }
-
-    _lastActivePaginationIndex = -1;
-
-    int newStart = _start - 1;
-    if (newStart >= 0 && newStart < _videoData.length) {
-      var newController = _initController(_videoData[newStart], newStart);
-      _preloadWindow.insert(0, newController);
-
-      if (_preloadWindow.length > _windowSize) {
-        await _disposeController(_preloadWindow.removeLast());
-      }
-
-      _start = newStart;
-      _end--;
-      _log(
-        'Scrolled backward - Window: $_start to $_end',
-        emoji: '⏪',
-        color: 'cyan',
-      );
-    }
-
-    _seeWhatsInsidePreloadWindow();
-  }
-
-  /// 暂停除指定索引外的所有视频
-  void _pauseAllExcept(int currentIndex) {
+  /// 暂停除指定索引外的所有项目
+  void _pauseOtherItems(int currentIndex) {
     int pausedCount = 0;
-    for (int i = 0; i < _preloadWindow.length; i++) {
-      int globalIndex = _start + i;
-      if (globalIndex != currentIndex && _preloadWindow[i].isPlaying) {
-        _preloadWindow[i].pause();
+    // 计算窗口实际起始位置
+    int windowStart = (_centerIndex - preloadBackward).clamp(0, _data.length - 1);
+
+    for (int i = 0; i < _controllers.length; i++) {
+      int globalIndex = windowStart + i;
+      if (globalIndex != currentIndex && _controllers[i].isPlaying) {
+        _controllers[i].pause();
         pausedCount++;
       }
     }
 
     if (pausedCount > 0) {
       _log(
-        'Paused $pausedCount video(s) except index: $currentIndex',
+        'Paused $pausedCount item(s) except index: $currentIndex',
         emoji: '⏸️',
         color: 'yellow',
       );
@@ -267,7 +232,7 @@ class PreloadManager<T> {
     }
   }
 
-  /// 自动播放当前索引的视频（带重试机制）
+  /// 自动播放当前索引的项目（带重试机制）
   void _autoPlayCurrent(int currentIndex) {
     if (_disposed) return; // 防止在已销毁状态下调用
 
@@ -275,75 +240,80 @@ class PreloadManager<T> {
     final controller = getControllerAtIndex(currentIndex);
     if (controller != null) {
       if (controller.isInitialized && !controller.isPlaying) {
-        controller.play();
-        _log(
-          'Auto-playing video at index: $currentIndex',
-          emoji: '▶️',
-          color: 'green',
-        );
-        // Notify UI of play state change
-        if (onPlayStateChanged != null) {
-          onPlayStateChanged!();
+        try {
+          controller.play();
+          _log(
+            'Auto-playing item at index: $currentIndex',
+            emoji: '▶️',
+            color: 'green',
+          );
+          // Notify UI of play state change
+          if (onPlayStateChanged != null) {
+            onPlayStateChanged!();
+          }
+        } catch (e) {
+          _log('Error playing controller at index $currentIndex: $e', emoji: '❌', color: 'red');
         }
       } else if (!controller.isInitialized) {
         // If not initialized yet, wait and try again
         _log(
-          'Waiting for video initialization at index: $currentIndex',
+          'Waiting for item initialization at index: $currentIndex',
           emoji: '⏳',
           color: 'yellow',
         );
       }
+    } else {
+      _log('Controller not found for index $currentIndex', emoji: '⚠️', color: 'yellow');
     }
   }
 
   Future<void> scroll(int index) async {
-    if (_disposed) return; // 防止在已销毁状态下调用
+    if (_disposed) return;
 
-    _log(
-      'Scrolling to index: $index (previous: $_prevIndex)',
-      emoji: '🔄',
-      color: 'blue',
-    );
-
-    // Pause all videos except the current one
-    _pauseAllExcept(index);
-
-    if (index == _prevIndex) return;
-
-    final int pivot = _start + _preloadBackward;
-
-    if (index > pivot) {
-      // Check for pagination before scrolling forward
-      await _checkAndTriggerPagination(index);
-      // Adjust window by scrolling forward
-      while (index > _start + _preloadBackward && _end < _videoData.length) {
-        await _onScrollForward(index);
-      }
-    } else if (index < pivot) {
-      // Adjust window by scrolling backward
-      while (index < _start + _preloadBackward && _start > 0) {
-        await _onScrollBackward(index);
-      }
+    // 数据为空检查
+    if (_data.isEmpty) {
+      _log('Cannot scroll - no data available', emoji: '⚠️', color: 'yellow');
+      return;
     }
 
-    _prevIndex = index;
+    // 边界检查
+    if (index < 0 || index >= _data.length) {
+      _log('Invalid scroll index: $index (data length: ${_data.length})', emoji: '❌', color: 'red');
+      return;
+    }
 
-    // Auto-play the current video with a small delay to ensure initialization
+    _log('Scrolling to index: $index (previous: $_prevIndex)', emoji: '🔄', color: 'blue');
+
+    // 暂停其他项目
+    _pauseOtherItems(index);
+
+    if (index == _prevIndex) {
+      _autoPlayCurrent(index);
+      return;
+    }
+
+    // 检查分页
+    await _triggerPaginationIfNeeded(index);
+
+    // 重建窗口到目标索引
+    await _rebuildPreloadWindow(index);
+
+    _prevIndex = index;
     _autoPlayCurrent(index);
   }
 
   /// 获取当前聚焦的控制器（窗口中部）
   PreloadController? getCurrentController() {
-    if (_preloadWindow.isEmpty) {
+    if (_controllers.isEmpty) {
       _log('Preload window is empty, cannot get current controller', emoji: '⚠️', color: 'yellow');
       return null;
     }
-    int center = (_preloadWindow.length / 2).floor();
-    return _preloadWindow[center];
+    int center = (_controllers.length / 2).floor();
+    return _controllers[center];
   }
 
   /// 获取所有激活的控制器（调试/外部访问）
-  List<PreloadController> getActiveControllers() => _preloadWindow;
+  List<PreloadController> getActiveControllers() => _controllers;
 
   /// 释放所有控制器
   Future<void> disposeAll() async {
@@ -351,37 +321,50 @@ class PreloadManager<T> {
 
     _disposed = true;
     _log('Disposing all controllers...', emoji: '🧹', color: 'red');
-    for (var controller in _preloadWindow) {
+    for (var controller in _controllers) {
       await _disposeController(controller);
     }
-    _preloadWindow.clear();
+    _controllers.clear();
     _log('All controllers disposed', emoji: '✅', color: 'green');
   }
 
   /// 安全获取：若索引越界返回 null
   PreloadController? getControllerAtIndex(int index) {
-    int relative = index - _start;
-    if (relative >= 0 && relative < _preloadWindow.length) {
-      return _preloadWindow[relative];
-    } else {
-      _log(
-        "Index $index is out of preload range ($_start - $_end)",
-        emoji: '⚠️',
-        color: 'yellow',
-      );
+    // 边界检查
+    if (index < 0 || index >= _data.length || _controllers.isEmpty) {
       return null;
     }
+
+    // 计算窗口实际范围（与 _rebuildPreloadWindow 保持一致）
+    int windowStart = (_centerIndex - preloadBackward).clamp(0, _data.length - 1);
+    int windowEnd = (_centerIndex + preloadForward + 1).clamp(0, _data.length);
+
+    // 检查索引是否在窗口范围内
+    if (index < windowStart || index >= windowEnd) {
+      return null;
+    }
+
+    // 计算在控制器数组中的相对位置
+    int relative = index - windowStart;
+    if (relative >= 0 && relative < _controllers.length) {
+      return _controllers[relative];
+    }
+
+    return null;
   }
 
-  /// 获取窗口起始索引
-  int getStart() => _start;
-
-  /// 获取当前播放索引
+  /// 获取当前活跃索引
   int getActiveIndex() => _activeIndex;
 
   /// 强制自动播放指定索引（初始化时使用）
   void forceAutoPlay(int index) {
     if (_disposed) return; // 防止在已销毁状态下调用
+
+    // 边界检查
+    if (index < 0 || index >= _data.length) {
+      _log('Invalid forceAutoPlay index: $index (data length: ${_data.length})', emoji: '❌', color: 'red');
+      return;
+    }
 
     _log('Force auto-playing index: $index', emoji: '🎬', color: 'magenta');
     _autoPlayCurrent(index);
@@ -391,284 +374,179 @@ class PreloadManager<T> {
   void togglePlayPause(PreloadController controller) {
     if (_disposed) return; // 防止在已销毁状态下调用
 
-    if (controller.isPlaying) {
-      controller.pause();
-      _log('Video paused', emoji: '⏸️', color: 'yellow');
-    } else {
-      // Pause all other videos first
-      for (var ctrl in _preloadWindow) {
-        if (ctrl != controller && ctrl.isPlaying) {
-          ctrl.pause();
+    try {
+      if (controller.isPlaying) {
+        controller.pause();
+        _log('Item paused', emoji: '⏸️', color: 'yellow');
+      } else {
+        // Pause all other items first
+        for (var ctrl in _controllers) {
+          if (ctrl != controller && ctrl.isPlaying) {
+            try {
+              ctrl.pause();
+            } catch (e) {
+              _log('Error pausing controller: $e', emoji: '⚠️', color: 'red');
+            }
+          }
+        }
+
+        // 确保控制器已初始化
+        if (controller.isInitialized) {
+          controller.play();
+          _log('Item resumed', emoji: '▶️', color: 'green');
+        } else {
+          _log('Cannot play uninitialized controller', emoji: '⚠️', color: 'yellow');
+          return;
         }
       }
-      controller.play();
-      _log('Video resumed', emoji: '▶️', color: 'green');
-    }
-    // Notify UI of play state change
-    if (onPlayStateChanged != null) {
-      onPlayStateChanged!();
+
+      // Notify UI of play state change
+      if (onPlayStateChanged != null) {
+        onPlayStateChanged!();
+      }
+    } catch (e) {
+      _log('Error in togglePlayPause: $e', emoji: '❌', color: 'red');
     }
   }
 
-  /// 获取视频总数
-  int getTotalVideoCount() => _videoData.length;
+  /// 获取数据总数
+  int getTotalCount() => _data.length;
 
-  /// 删除指定索引的视频
-  /// [index] 要删除的视频索引
-  /// 返回是否删除成功
-  Future<bool> removeVideo(int index) async {
-    if (_disposed) return false;
+  /// 删除指定索引的数据
+  Future<bool> removeData(int index) async {
+    if (_disposed || index < 0 || index >= _data.length) return false;
 
-    if (index < 0 || index >= _videoData.length) {
-      _log('Invalid remove parameter: index=$index', emoji: '❌', color: 'red');
-      return false;
-    }
+    _log('Removing item at index $index', emoji: '🗑️', color: 'red');
 
-    _log('Removing video at index $index', emoji: '🗑️', color: 'red');
-
-    // 删除视频URL
-    _videoData.removeAt(index);
-
-    // 处理预加载窗口的调整
-    await _adjustPreloadWindowAfterRemove(index, 1);
-
-    // 调整当前播放索引
+    _data.removeAt(index);
     _adjustActiveIndexAfterRemove(index, 1);
 
-    _log('Successfully removed video at index $index', emoji: '✅', color: 'green');
+    // 重建窗口 - 确保锚点有效
+    int anchor;
+    if (_data.isEmpty) {
+      return true; // 数据为空，无需重建窗口
+    } else if (_activeIndex >= 0 && _activeIndex < _data.length) {
+      anchor = _activeIndex;
+    } else {
+      anchor = index.clamp(0, _data.length - 1);
+    }
+    await _rebuildPreloadWindow(anchor);
+
+    _log('Successfully removed item at index $index', emoji: '✅', color: 'green');
     return true;
   }
 
-  /// 在列表末尾追加视频数据
-  /// 返回实际追加的数量
-  Future<int> addVideos(List<T> videos) async {
-    if (_disposed) return 0;
-    if (videos.isEmpty) return 0;
+  /// 在列表末尾追加数据
+  Future<int> addData(List<T> data) async {
+    if (_disposed || data.isEmpty) return 0;
 
-    _videoData.addAll(videos);
-    _log('Manually added ${videos.length} video(s) to the end', emoji: '➕', color: 'green');
+    _data.addAll(data);
+    _log('Added ${data.length} item(s) to the end', emoji: '➕', color: 'green');
 
-    // 追加后尽量把预加载窗口补满
-    await _fillWindowAfterAppend();
-    return videos.length;
+    // 重建窗口
+    final anchor = _activeIndex >= 0 ? _activeIndex : 0;
+    await _rebuildPreloadWindow(anchor);
+
+    return data.length;
   }
 
-  /// 重新设置数据源，并在 [initialIndex] 附近重建预加载窗口
-  Future<void> setDataSource(List<T> videoData, {int initialIndex = 0, bool autoPlay = true}) async {
+  /// 重新设置数据源
+  Future<void> setDataSource(List<T> data, {int initialIndex = 0, bool autoPlay = true}) async {
     if (_disposed) return;
 
-    // 清理旧窗口
-    for (var controller in _preloadWindow) {
+    // 先清理现有资源
+    for (var controller in _controllers) {
       await _disposeController(controller);
     }
-    _preloadWindow.clear();
+    _controllers.clear();
 
-    // 重置内部状态
-    _videoData = List.of(videoData);
+    // 重置状态
+    _data = List.of(data);
     _isPaginating = false;
-    _firstVideoPlayed = false;
+    _firstItemPlayed = false;
     _activeIndex = -1;
     _prevIndex = 0;
-    _lastActivePaginationIndex = -1;
 
-    if (_videoData.isEmpty) {
-      _start = 0;
-      _end = 0;
-      _log('Set empty data source; window cleared', emoji: '🧹', color: 'yellow');
-      return;
-    }
+    if (_data.isNotEmpty) {
+      int targetIndex = initialIndex.clamp(0, _data.length - 1);
+      await _rebuildPreloadWindow(targetIndex);
 
-    // 规范化初始索引
-    int targetIndex = initialIndex;
-    if (targetIndex < 0) targetIndex = 0;
-    if (targetIndex >= _videoData.length) targetIndex = _videoData.length - 1;
-
-    // 计算新的窗口范围
-    final startIdx = (targetIndex - _preloadBackward).clamp(0, _videoData.length - 1);
-    final endIdx = (targetIndex + _preloadForward + 1).clamp(0, _videoData.length);
-
-    _start = startIdx;
-    _end = endIdx;
-
-    // 初始化窗口内控制器
-    for (int i = startIdx; i < endIdx; i++) {
-      _preloadWindow.add(_initController(_videoData[i], i));
-    }
-
-    _seeWhatsInsidePreloadWindow();
-
-    // 自动播放初始索引（可配置）
-    if (autoPlay) {
-      _autoPlayCurrent(targetIndex);
+      if (autoPlay) {
+        _autoPlayCurrent(targetIndex);
+      }
     }
   }
 
-  /// 追加数据后，尽量将窗口补齐到设定大小
-  Future<void> _fillWindowAfterAppend() async {
-    if (_disposed) return;
+  /// 在指定位置插入数据
+  Future<bool> insertData(int index, List<T> data) async {
+    if (_disposed || index < 0 || index > _data.length || data.isEmpty) return false;
 
-    final desiredEnd = (_start + _windowSize).clamp(0, _videoData.length);
-    while (_end < desiredEnd && _end < _videoData.length) {
-      _preloadWindow.add(_initController(_videoData[_end], _end));
-      _end++;
-    }
-    _seeWhatsInsidePreloadWindow();
-  }
+    _log('Inserting ${data.length} item(s) at index $index', emoji: '➕', color: 'green');
 
-  /// 在指定位置插入视频
-  /// [index] 插入位置索引
-  /// [videoData] 要插入的视频数据列表
-  /// 返回是否插入成功
-  Future<bool> insertVideos(int index, List<T> videoData) async {
-    if (_disposed) return false;
+    _data.insertAll(index, data);
+    _adjustActiveIndexAfterInsert(index, data.length);
 
-    if (index < 0 || index > _videoData.length || videoData.isEmpty) {
-      _log('Invalid insert parameters: index=$index, data=${videoData.length}', emoji: '❌', color: 'red');
-      return false;
-    }
+    // 重建窗口
+    final anchor = _activeIndex >= 0 ? _activeIndex : index;
+    await _rebuildPreloadWindow(anchor);
 
-    _log('Inserting ${videoData.length} video(s) at index $index', emoji: '➕', color: 'green');
-
-    // 插入视频数据
-    _videoData.insertAll(index, videoData);
-
-    // 处理预加载窗口的调整
-    await _adjustPreloadWindowAfterInsert(index, videoData.length);
-
-    // 调整当前播放索引
-    _adjustActiveIndexAfterInsert(index, videoData.length);
-
-    _log('Successfully inserted ${videoData.length} video(s)', emoji: '✅', color: 'green');
+    _log('Successfully inserted ${data.length} item(s)', emoji: '✅', color: 'green');
     return true;
   }
 
-  /// 调整预加载窗口（删除后）
-  Future<void> _adjustPreloadWindowAfterRemove(int removedIndex, int removedCount) async {
-    // 如果删除的范围在预加载窗口之外，只需要调整索引
-    if (removedIndex >= _end) {
-      // 删除范围在窗口之后，只需要调整结束索引
-      _end = (_end - removedCount).clamp(0, _videoData.length);
-      return;
-    }
-
-    if (removedIndex + removedCount <= _start) {
-      // 删除范围在窗口之前，需要调整开始和结束索引
-      _start = (_start - removedCount).clamp(0, _videoData.length);
-      _end = (_end - removedCount).clamp(0, _videoData.length);
-      return;
-    }
-
-    // 删除范围与预加载窗口重叠，需要重新构建窗口
-    await _rebuildPreloadWindow();
-  }
-
-  /// 调整预加载窗口（插入后）
-  Future<void> _adjustPreloadWindowAfterInsert(int insertIndex, int insertCount) async {
-    // 如果插入位置在预加载窗口之后，只需要调整索引
-    if (insertIndex >= _end) {
-      _end = (_end + insertCount).clamp(0, _videoData.length);
-      return;
-    }
-
-    if (insertIndex <= _start) {
-      // 插入位置在窗口之前，需要调整索引
-      _start = (_start + insertCount).clamp(0, _videoData.length);
-      _end = (_end + insertCount).clamp(0, _videoData.length);
-      return;
-    }
-
-    // 插入位置在窗口内部，需要重新构建窗口
-    await _rebuildPreloadWindow();
-  }
-
-  /// 重新构建预加载窗口
-  Future<void> _rebuildPreloadWindow() async {
-    _log('Rebuilding preload window due to structural changes', emoji: '🔨', color: 'yellow');
-
-    // 清理现有控制器
-    for (var controller in _preloadWindow) {
-      await _disposeController(controller);
-    }
-    _preloadWindow.clear();
-
-    // 重新计算窗口范围
-    final currentIndex = _activeIndex >= 0 ? _activeIndex : 0;
-    final startIdx = (currentIndex - _preloadBackward).clamp(0, _videoData.length - 1);
-    final endIdx = (currentIndex + _preloadForward + 1).clamp(0, _videoData.length);
-
-    _start = startIdx;
-    _end = endIdx;
-
-    // 重新初始化控制器
-    for (int i = startIdx; i < endIdx; i++) {
-      if (i < _videoData.length) {
-        _preloadWindow.add(_initController(_videoData[i], i));
-      }
-    }
-
-    _log('Preload window rebuilt: $_start to $_end', emoji: '✅', color: 'green');
-  }
-
-  /// 调整当前播放索引（删除后）
+  /// 调整当前活跃索引（删除后）
   void _adjustActiveIndexAfterRemove(int removedIndex, int removedCount) {
     if (_activeIndex < 0) return;
 
     if (_activeIndex < removedIndex) {
-      // 当前播放的视频在删除范围之前，无需调整
+      // 当前活跃的项目在删除范围之前，无需调整
       return;
     }
 
     if (_activeIndex < removedIndex + removedCount) {
-      // 当前播放的视频被删除了，需要选择新的播放位置
+      // 当前活跃的项目被删除了，需要选择新的活跃位置
       if (removedIndex > 0) {
-        _activeIndex = removedIndex - 1; // 播放前一个视频
-      } else if (_videoData.isNotEmpty) {
-        _activeIndex = 0; // 播放第一个视频
+        _activeIndex = removedIndex - 1; // 活跃前一个项目
+      } else if (_data.isNotEmpty) {
+        _activeIndex = 0; // 活跃第一个项目
       } else {
-        _activeIndex = -1; // 没有视频了
+        _activeIndex = -1; // 没有项目了
       }
       _log('Active index adjusted to $_activeIndex after removal', emoji: '🔄', color: 'yellow');
     } else {
-      // 当前播放的视频在删除范围之后，需要调整索引
-      _activeIndex = (_activeIndex - removedCount).clamp(0, _videoData.length - 1);
+      // 当前活跃的项目在删除范围之后，需要调整索引
+      _activeIndex = (_activeIndex - removedCount).clamp(0, _data.length - 1);
       _log('Active index adjusted to $_activeIndex after removal', emoji: '🔄', color: 'yellow');
     }
   }
 
-  /// 调整当前播放索引（插入后）
+  /// 调整当前活跃索引（插入后）
   void _adjustActiveIndexAfterInsert(int insertIndex, int insertCount) {
     if (_activeIndex < 0) return;
 
     if (_activeIndex < insertIndex) {
-      // 当前播放的视频在插入位置之前，无需调整
+      // 当前活跃的项目在插入位置之前，无需调整
       return;
     }
 
-    // 当前播放的视频在插入位置之后，需要调整索引
-    _activeIndex = (_activeIndex + insertCount).clamp(0, _videoData.length - 1);
+    // 当前活跃的项目在插入位置之后，需要调整索引
+    _activeIndex = (_activeIndex + insertCount).clamp(0, _data.length - 1);
     _log('Active index adjusted to $_activeIndex after insertion', emoji: '🔄', color: 'yellow');
   }
 
-  /// 获取视频列表的当前状态
-  Map<String, dynamic> getVideoListStatus() {
+  /// 获取数据列表的当前状态
+  Map<String, dynamic> getDataListStatus() {
     return {
-      'totalVideos': _videoData.length,
-      'preloadWindowStart': _start,
-      'preloadWindowEnd': _end,
+      'totalItems': _data.length,
+      'preloadWindowCenter': _centerIndex,
+      'preloadWindowStart': _centerIndex - preloadBackward,
+      'preloadWindowEnd': _centerIndex + preloadForward,
       'activeIndex': _activeIndex,
       'previousIndex': _prevIndex,
-      'windowSize': _preloadWindow.length,
+      'windowSize': _controllers.length,
       'isPaginating': _isPaginating,
       'disposed': _disposed,
     };
-  }
-
-  void _seeWhatsInsidePreloadWindow() {
-    _log(
-      "Preload Window | Start: $_start | End: $_end | Total Videos: ${_videoData.length}",
-      emoji: '🔍',
-      color: 'blue',
-    );
   }
 
   /// 彩色日志（带表情符号）
