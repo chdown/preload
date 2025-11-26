@@ -47,7 +47,8 @@ class PreloadManager<T> {
     this.paginationThreshold = 5,
     bool autoplayFirstItem = false,
   }) : _autoplayFirstVideo = autoplayFirstItem {
-    // 外部通过 dataList 访问
+    // PreloadManager 完全拥有数据：创建副本而非引用外部列表
+    // 这样确保数据的单一所有权，外部通过 dataList 访问
     _data = List.of(data);
 
     _preloadBackward = preloadBackward ?? 3;
@@ -379,6 +380,25 @@ class PreloadManager<T> {
     _log('Force auto-playing index: $index', emoji: '🎬', color: 'magenta');
     _autoPlayCurrent(index);
   }
+
+  // ========== 生命周期辅助方法 ==========
+
+  /// 暂停所有视频（用于 App 切到后台或页面不可见）
+  void pauseAll() {
+    if (_disposed) return;
+    _pauseAllExcept(-1);  // -1 表示暂停所有
+    _log('All videos paused', emoji: '⏸️', color: 'yellow');
+  }
+
+  /// 恢复当前激活的视频（用于 App 回到前台或页面可见）
+  void resumeCurrent() {
+    if (_disposed) return;
+    if (_activeIndex >= 0) {
+      _autoPlayCurrent(_activeIndex);
+      _log('Resumed video at index: $_activeIndex', emoji: '▶️', color: 'green');
+    }
+  }
+
 
   /// 切换指定控制器的播放/暂停
   void togglePlayPause(PreloadController controller) {
