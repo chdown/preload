@@ -47,6 +47,7 @@ class PreloadManager<T> {
     this.paginationThreshold = 5,
     bool autoplayFirstItem = false,
   }) : _autoplayFirstVideo = autoplayFirstItem {
+    // 外部通过 dataList 访问
     _data = List.of(data);
 
     _preloadBackward = preloadBackward ?? 3;
@@ -132,7 +133,7 @@ class PreloadManager<T> {
 
   /// 检查是否需要分页并触发
   Future<void> _checkAndTriggerPagination(int currentIndex) async {
-    if (_isPaginating) return;
+    if (_isPaginating || _disposed) return;  // 添加 _disposed 安全检查
 
     final remainingItems = _data.length - currentIndex - 1;
 
@@ -244,6 +245,8 @@ class PreloadManager<T> {
 
   /// 暂停除指定索引外的所有视频
   void _pauseAllExcept(int currentIndex) {
+    if (_disposed) return; // 防止在已销毁状态下调用
+
     int pausedCount = 0;
     for (int i = 0; i < _preloadWindow.length; i++) {
       int globalIndex = _start + i;
@@ -332,16 +335,6 @@ class PreloadManager<T> {
     _autoPlayCurrent(index);
   }
 
-  /// 获取当前聚焦的控制器（窗口中部）
-  PreloadController? getCurrentController() {
-    if (_preloadWindow.isEmpty) {
-      _log('Preload window is empty, cannot get current controller', emoji: '⚠️', color: 'yellow');
-      return null;
-    }
-    int center = (_preloadWindow.length / 2).floor();
-    return _preloadWindow[center];
-  }
-
   /// 获取所有激活的控制器（调试/外部访问）
   List<PreloadController> getActiveControllers() => _preloadWindow;
 
@@ -392,16 +385,16 @@ class PreloadManager<T> {
     if (_disposed) return; // 防止在已销毁状态下调用
 
     if (controller.isPlaying) {
-      controller.pause();
+      if (!_disposed) controller.pause();
       _log('Video paused', emoji: '⏸️', color: 'yellow');
     } else {
       // Pause all other videos first
       for (var ctrl in _preloadWindow) {
-        if (ctrl != controller && ctrl.isPlaying) {
+        if (ctrl != controller && ctrl.isPlaying && !_disposed) {
           ctrl.pause();
         }
       }
-      controller.play();
+      if (!_disposed) controller.play();
       _log('Video resumed', emoji: '▶️', color: 'green');
     }
     // Notify UI of play state change
@@ -410,8 +403,16 @@ class PreloadManager<T> {
     }
   }
 
+  // ========== 数据访问 API ==========
+
+  /// 获取数据列表（可直接修改，PreloadManager 拥有此列表）
+  List<T> get dataList => _data;
+
   /// 获取视频总数
-  int getTotalVideoCount() => _data.length;
+  int get length => _data.length;
+
+  /// 检查列表是否为空
+  bool get isEmpty => _data.isEmpty;
 
   /// 删除指定索引的视频
   /// [index] 要删除的视频索引
@@ -457,6 +458,8 @@ class PreloadManager<T> {
   Future<void> setDataSource(List<T> data, {int initialIndex = 0, bool autoPlay = true}) async {
     if (_disposed) return;
 
+    _log('🔄 setDataSource called - old data.length: ${_data.length}, new data.length: ${data.length}', emoji: '🔄', color: 'magenta');
+
     // 清理旧窗口
     for (var controller in _preloadWindow) {
       await _disposeController(controller);
@@ -464,7 +467,7 @@ class PreloadManager<T> {
     _preloadWindow.clear();
 
     // 重置内部状态
-    _data = List.of(data);
+    _data = List.of(data);  // 创建副本，PreloadManager 完全拥有数据
     _isPaginating = false;
     _firstVideoPlayed = false;
     _activeIndex = -1;
@@ -484,14 +487,19 @@ class PreloadManager<T> {
     if (targetIndex >= _data.length) targetIndex = _data.length - 1;
 
     // 计算新的窗口范围
-    final startIdx = (targetIndex - _preloadBackward).clamp(0, _data.length - 1);
-    final endIdx = (targetIndex + _preloadForward + 1).clamp(0, _data.length);
+    // 窗口应该包含 windowSize 个元素，以 targetIndex 为中心
+    // 但要确保窗口不超出数据范围
+    final startIdx = (targetIndex - _preloadBackward).clamp(0, _data.length);
+    final endIdx = (startIdx + _windowSize).clamp(0, _data.length);
 
     _start = startIdx;
     _end = endIdx;
 
+    _log('📊 Creating controllers - start: $_start, end: $_end, targetIndex: $targetIndex, windowSize: $_windowSize', emoji: '📊', color: 'blue');
+
     // 初始化窗口内控制器
     for (int i = startIdx; i < endIdx; i++) {
+      _log('  Creating controller for index $i, dataId: ${_data[i]}', emoji: '  🎬', color: 'cyan');
       _preloadWindow.add(_initController(_data[i], i));
     }
 
@@ -593,8 +601,9 @@ class PreloadManager<T> {
 
     // 重新计算窗口范围
     final currentIndex = _activeIndex >= 0 ? _activeIndex : 0;
-    final startIdx = (currentIndex - _preloadBackward).clamp(0, _data.length - 1);
-    final endIdx = (currentIndex + _preloadForward + 1).clamp(0, _data.length);
+    // 使用正确的窗口计算公式（与 setDataSource 一致）
+    final startIdx = (currentIndex - _preloadBackward).clamp(0, _data.length);
+    final endIdx = (startIdx + _windowSize).clamp(0, _data.length);
 
     _start = startIdx;
     _end = endIdx;
